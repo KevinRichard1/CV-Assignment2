@@ -124,32 +124,41 @@ def nt_xent(z1: torch.Tensor, z2: torch.Tensor,
         [torch.diag(sim, batch_size), torch.diag(sim, -batch_size)]
     )
     sim = sim.masked_fill(
-        torch.eye(2 * batch_size, device=z.device).bool(), -1e9)
+        torch.eye(2 * batch_size, device=z.device).bool(), -1e4)
     denominator = sim.exp().sum(dim=1)
     return -(positives - torch.log(denominator + 1e-12)).mean()
 
 
 def train_simclr(model: nn.Module, loader: DataLoader, device: torch.device,
                  epochs: int, lr: float, ckpt_path: str,
-                 log_every: int = 20) -> None:
+                 log_every: int = 20, accum_steps: int = 1,
+                 amp: bool = True) -> None:
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and device.type == "cuda")
+    use_amp = amp and device.type == "cuda"
 
     model.train()
     for epoch in range(1, epochs + 1):
         running = 0.0
         n_batches = 0
-        for view1, view2 in loader:
+        optimizer.zero_grad(set_to_none=True)
+        for i, (view1, view2) in enumerate(loader):
             view1 = view1.to(device, non_blocking=True)
             view2 = view2.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            _, p1 = model(view1)
-            _, p2 = model(view2)
-            loss = nt_xent(p1, p2)
-            loss.backward()
-            optimizer.step()
-            running += loss.item()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                _, p1 = model(view1)
+                _, p2 = model(view2)
+                loss_full = nt_xent(p1, p2)
+                loss = loss_full / accum_steps
+            scaler.scale(loss).backward()
+            last_batch = (i + 1) == len(loader)
+            if (i + 1) % accum_steps == 0 or last_batch:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            running += loss_full.item()
             n_batches += 1
         scheduler.step()
         if epoch % log_every == 0 or epoch == 1:
@@ -285,7 +294,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", default="data")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--ssl_epochs", type=int, default=300)
-    p.add_argument("--ssl_batch", type=int, default=256)
+    p.add_argument("--ssl_batch", type=int, default=128,
+                   help="per-step SSL batch (two views are processed per step)")
+    p.add_argument("--ssl_accum_steps", type=int, default=2,
+                   help="gradient accumulation steps (effective batch = ssl_batch * accum_steps)")
     p.add_argument("--ssl_lr", type=float, default=1e-3)
     p.add_argument("--ft_epochs", type=int, default=150)
     p.add_argument("--ft_batch", type=int, default=128)
@@ -351,7 +363,8 @@ def main() -> None:
 
     train_simclr(simclr, ssl_loader, device,
                  epochs=args.ssl_epochs, lr=args.ssl_lr,
-                 ckpt_path=args.ssl_ckpt)
+                 ckpt_path=args.ssl_ckpt,
+                 accum_steps=args.ssl_accum_steps, amp=amp)
 
     # ================= Stage 2a: Linear probe =================
     print("\n=== Stage 2a: Linear probe (head only) ===")

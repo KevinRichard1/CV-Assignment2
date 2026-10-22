@@ -1,3 +1,4 @@
 data
 *.pdf
 __pycache__
+*.zip
